@@ -1,0 +1,517 @@
+---
+title: "Exploratory Analysis of Electricity Prices in Spain"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(readr)
+library(tidyverse)
+library(corrplot)
+library(leaps)
+library(glmnet)
+library(tree)
+library(janitor)
+library(caret)
+library(e1071)
+library(randomForest)
+```
+
+
+```{r}
+# Load Data
+energy.data <- read_csv("../archive/energy_dataset.csv", show_col_types = FALSE)
+weather.data <- read_csv("../archive/weather_features.csv", show_col_types = FALSE)
+```
+
+### Part 1: Data Cleaning
+
+```{r}
+# Display Weather Data
+colnames(weather.data)[1] = "time"
+head(weather.data)
+```
+
+```{r}
+# Check missing values in weather data
+sapply(weather.data, function(x) sum(is.na(x)))
+```
+
+We need to separate the weather data into the 5 different cities: Valencia, Barcelona, Madrid, Bilbao and Seville, and then we can correctly merge the two datasets together.
+
+```{r}
+# separate the weather data by cities
+Valencia_df <- weather.data %>%
+  filter(city_name == "Valencia") %>%
+  select(-city_name)
+Madrid_df <- weather.data %>%
+  filter(city_name == "Madrid") %>%
+  select(-city_name)
+Bilbao_df <- weather.data %>%
+  filter(city_name == "Bilbao") %>%
+  select(-city_name)
+Barcelona_df <- weather.data %>%
+  filter(city_name == "Barcelona") %>%
+  select(-city_name)
+Seville_df <- weather.data %>%
+  filter(city_name == "Seville") %>%
+  select(-city_name)
+```
+
+However, as we can see, even though these 5 datasets start (December 31, 2014 at 11pm) and end at the same time (December 31, 2018 at 10pm), the ones for the cities seem to have about 500 observations more each than the energy one, when we expect both to have exactly the same number of rows. At first I believed that it was due to missing rows in the energy data set, but after careful examionation, I discovered that it was due to duplicated rows in the weather datasets. For example, here are some of the duplicate rows in the Seville weather dataframe.
+
+```{r}
+# check for duplicate rows
+n_occur <- data.frame(table(Seville_df$time))
+n_occur[n_occur$Freq > 1,]
+```
+
+```{r}
+# Example of repeated rows in Seville Data
+Seville_df[1494:1497,]
+```
+
+```{r}
+# Remove Duplicated Observations in Each weather dataset
+Seville_df <- Seville_df %>%
+  distinct(time, .keep_all = TRUE)
+Valencia_df <- Valencia_df %>%
+  distinct(time, .keep_all = TRUE)
+Madrid_df <- Madrid_df %>%
+  distinct(time, .keep_all = TRUE)
+Barcelona_df <- Barcelona_df %>%
+  distinct(time, .keep_all = TRUE)
+Bilbao_df <- Bilbao_df %>%
+  distinct(time, .keep_all = TRUE)
+```
+
+Now we see that all the datasets we need to move forward have the right number of rows, and all the indexes will now match up as there is no duplicates. Next, I will check for missing values in the energy data.
+
+```{r}
+# check for missing values in energy data
+sapply(energy.data, function(x) sum(is.na(x)))
+```
+
+```{r}
+#remove columns with far too missing data
+drop <- c("generation hydro pumped storage aggregated", "forecast wind offshore eday ahead")
+energy.data = energy.data[,!(names(energy.data) %in% drop)]
+```
+
+After this, there will still be some missing values in some columns, so we'll see if they happen to be in the same rows or in distinct ones.
+
+```{r}
+# check how many missing values per row
+missing_df <- data.frame(which(is.na(energy.data), arr.ind=TRUE))
+data.frame(table(missing_df$row))
+```
+
+As we can see, there are 47 rows with 1 or more missing values. Since in total we have over 35,000 observations, I will simply drop these rows from the dataset as we can afford to loose this very little amount of data points. Given that this can be considered a time series data set, we could use advanced methods of imputation such as the moving average which computes the missing value as the average of the observations close to it, but again, it's so few that it isn't necesarry and dropping those rows is sufficient.
+
+```{r}
+# drop rows with missing values
+energy.data <- energy.data %>%
+  drop_na()
+```
+
+Later, when we join the weather and energy datasets, the fact that they are once again not of the same size doesn't matter, because we will use an inner join and R will simply ignore the observations that are in the weather dataset but not in the energy one. Now, we can proceed to do feature extraction on both the energy and the weather data, since it is clear we have far too many variables.
+
+Also, I intially noticed that some columns in the energy dataset have all the same values for every single row, so I will go ahead and drop those as they are useless to preiction or inference. One way to find those columns is to find the ones with 0 standard deviation. 
+
+```{r}
+# some columns just have the same value in all rows so we'll get rid of those since it's useless
+# one way to find them is to see which columns have std 0.
+df <- energy.data %>%
+  summarise_if(is.numeric, sd)
+data.frame(t(df)) %>%
+  filter(t.df. == 0)
+```
+
+```{r}
+drop <- c("generation fossil coal-derived gas", "generation fossil oil shale", "generation fossil peat",
+          "generation geothermal","generation marine", "generation wind offshore")
+energy.data <- energy.data[,!(names(energy.data) %in% drop)]
+energy.data <- na.omit(energy.data)
+```
+
+### Part 2: Featuring Engineering
+
+Given that we have 15 variables for each of the 5 cities, and then 19 predictor variables in the energy dataset, I will start engineering features so that we can reduce dimensions, and combine the different datasets properly. Since the purpose of this analysis is primarily inference, I will try to keep the engineered features as simple as possible so that we can easily interpret them further on. I will first drop the unusable variables such as weather icon, which just gives us a code which is difficult for us to interpret without the necesary information. 
+
+```{r}
+# drop the unimportant variables from each city's dataset
+drop <- c("wind_deg", "weather_id", "weather_main", "weather_description","weather_icon")
+Barcelona_df <- Barcelona_df[,!(names(Barcelona_df) %in% drop)]
+Bilbao_df <- Bilbao_df[,!(names(Bilbao_df) %in% drop)]
+Madrid_df <- Madrid_df[,!(names(Madrid_df) %in% drop)]
+Seville_df <- Seville_df[,!(names(Seville_df) %in% drop)]
+Valencia_df <- Valencia_df[,!(names(Valencia_df) %in% drop)]
+```
+
+For all the remaining variables in the weather datasets, I will take the average for each time from the 5 different cities, so we will get average temperature accross the 5 cities, average rain accross the 5 cities, etc and put them in a single dataframe called weather_features.
+
+```{r}
+weather.features <- data.frame(matrix(ncol = 11, nrow = 35064))
+colnames(weather.features) <- colnames(Madrid_df)
+weather.features[,1] <- Madrid_df[,1]
+# get averages
+for (j in c(2,5,6,7,8,9,10,11)) {
+  for (i in 1:35064) {
+    weather.features[i,j] = (Bilbao_df[i,j]+Madrid_df[i,j]+Barcelona_df[i,j]+Valencia_df[i,j]+Seville_df[i,j])/5
+  }
+}
+```
+
+However, for maximum temperature, I will instead take the absolute maximum temperature accross the 5 cities, and for the minimum temperature I will take the minimum.
+
+```{r}
+# find min temp
+for (i in 1:35064) {
+  weather.features[i,3] = min(Bilbao_df[i,3],Madrid_df[i,3],Barcelona_df[i,3],Valencia_df[i,3],Seville_df[i,3])
+}
+#find max temp
+for (i in 1:35064) {
+  weather.features[i,4] = max(Bilbao_df[i,4],Madrid_df[i,4],Barcelona_df[i,4],Valencia_df[i,4],Seville_df[i,4])
+}
+```
+
+Then, I'll merge it with the energy dataset by index in order to create one dataset.
+
+```{r}
+data <- merge(x=energy.data, y=weather.features, by="time", all=FALSE)
+data <- data[,-1]
+dim(data)
+```
+
+As we can see, we still have 30-1=29 variables, so I'll further analyze them to see if we can reduce them. We could also try some other technique such as PCA, but unfortunately that would make it very hard for us to infer any type of information from them.
+
+However, before I do that, I will rename the variables in the dataset so that it is easier to work with.
+
+```{r}
+names <- c("Biomass", "Brown coal", "Gas", "Hard coal", "Oil", "Hydro Pumped", "Hyrdro River", "Hydro Reservoir", "Nuclear", "Other", "Other Renewable", "Solar", "Waste", "Wind", "Forecast Solar", "Forecast Wind", "Total Load Forecast", "Total Load", "Price Forecast", "Price", "Avg. Temp", "Min Temp", "Max Temp", "Pressure", "Humidity", "Wind Speed", "Rain1h", "Rain3h", "Snow", "Clouds")
+colnames(data) <- names
+```
+
+Then, I will remove the "forecast" variables, as they are derived values and aren't actual measured values, so they will deter us from having a clean look at the energy production and pricing process and instead will introducce unwated artificial information. If we were doing prediction however, I would probably not remove them as they could prove to be useful variables for prediction. I want to see what the electrical grid does, not what trading specialists did.
+
+```{r}
+drop <- c("Forecast Solar", "Forecast Wind", "Total Load Forecast", "Price Forecast", "Rain 1h")
+data <- data[,!(names(data) %in% drop)]
+```
+
+Then, I will combine the two coal variables into one single coal variable, as from my research they are very similar and used for the same purpose, the only difference being how they are mined.
+
+```{r}
+data <- data %>%
+  mutate(Coal = `Brown coal` + `Hard coal`, .keep = "unused")
+```
+
+Similarly, I will combine the 'other' variables to get it ll under one general 'other' variable, as the documentation is vague on the difference between "other" and "other renewable".
+
+```{r}
+data <- data %>%
+  mutate(Others = `Other` + `Other Renewable`, .keep = "unused")
+```
+
+Then, I will analyze the relationship between Total Load and Price, because once again, Total Load isn't necesarily a measure of production nor is it a variable of weather and as we can see in the graph below, it is very closely related to Price. To make this graph, I scaled both of them to have mean 0 and standard deviation 1. This will allow us to see them both on the same chart, otherwise the much bigger scale of Total Load would make Price impossible to see.
+
+```{r}
+scaled.price <- data.frame(scale(data[,c(11,12)]))
+ggplot(scaled.price[300:550,], aes(x=1:nrow(scaled.price[300:550,]))) + geom_line(aes(y=Price), color="darkred") + geom_line(aes(y=`Total.Load`), color="steelblue") + labs(title="Price and Total Load for an Example Time Range", x="Time", y="Scaled Value")
+```
+
+This trend makes a lot of sense, since generally, price and demand are very closely related, and Total Load measures how much electricity is being used by the population, which is basically the demand. Therefore, I will drop Total Load from the dataset as it would distract us from actually measuring the price. I will include another model at the end which includes Total Load which will show how it dominates the inference about Price.
+
+```{r}
+# Drop Total Load from Dataset
+data <- data[,!(names(data) %in% c("Total Load"))]
+```
+
+Then, I will plot the distribution of prices to analyze it.
+
+```{r}
+# Distribution of Prices
+ggplot(data, aes(x=Price)) + geom_histogram(bins=30) + labs(title="Distribution of Prices")
+```
+
+As we can see, it creates a very clear normal distribution. This means that we have a lot of data to work with for the prices in the middle, and unfortunately not as much data for the prices on either extreme, but it will also hopefully help us single out what can cause those extremes.
+
+Then, I will plot a correlation plot to have an idea how the variables act amongst them and with Price.
+
+```{r}
+corrplot(cor(data), method='color', tl.cex = 0.5)
+```
+
+We can see that apart from strong correlations between the varaibles, except for humidity and the temperature variables, the correlation values are close to 0, which can imply a somewhat complex structure. However, since the goal of this analysis is inference, I will start with the least complicated model at first and then build to somewhat more complicated models and then analyze the performance of them, to gauge which one gives us the most accurate insights into the data.
+
+### Part 3: Analysis
+
+First, I will split the data into a training and testing set using a 70%-30% separation.
+
+```{r}
+# first move the Price column so it is at the end for easiness
+data <- data %>% 
+  relocate(`Price`, .after = last_col())
+# Split data
+set.seed(1)
+sample <- sample(c(TRUE, FALSE), nrow(data), replace=TRUE, prob=c(0.7,0.3))
+train  <- data[sample, ]
+test   <- data[!sample, ]
+```
+
+#### 3.1: Feature Selection Using Lasso Regression
+
+I chose Lasso regression because hypothetically, it will push the coefficients of unimportant variables towards 0, essentially performing variable selection.
+
+```{r}
+# Scale data to use with Lasso Regression
+scaled.train <- data.frame(scale(train[,-23]))
+scaled.train$Price <- train$Price
+```
+
+```{r}
+# Choose the Lasso penalization parameter using 5-fold cross validation
+model.cv_lasso <- cv.glmnet(x=as.matrix(scaled.train[,-23]), y=scaled.train$Price, nfolds=5)
+plot(model.cv_lasso)
+```
+```{r}
+# Determine value of lambda that gives the lowest cross validation MSE
+model.cv_lasso$lambda.min
+```
+
+```{r}
+# Get coefficients for the linear regression model using that lambda value
+coef(model.cv_lasso, model.cv_lasso$lambda.min)
+```
+
+```{r}
+# Calculate test MSE for Lasso Regression
+scaled.test <- data.frame(scale(test[,-23]))
+scaled.test[23] <- test$Price
+colnames(scaled.test)[23] <- "Price"
+y.pred <- predict(model.cv_lasso, newx=as.matrix(scaled.test[,-23]), s=model.cv_lasso$lambda.min)
+MSE.test_lasso <- mean((scaled.test$Price - y.pred) ^ 2)
+MSE.test_lasso
+```
+
+As we can see, no of the coefficients were completely pushed towards 0, and we see that the plot of cross validation MSE against lambda is monotonically increasing, implying that the model is far too simple to fit this data. However, there is still some value to it because, for example, we can see that Gas, Avg. Temperature and Coal have large, positive relationships to price, whereas wind speed and hydro pumped have large negative ones. We also see it has a test MSE of 116.1, which for the time being doesn't quite tell us much, but gives us a good starting point to compare future models.
+
+#### 3.2: Prunning a Simple Decision Tree
+
+Given that the results from the Lasso Regression were not too conclusive, I will proceed with a decision tree model which will hopefully fit the structure of the data better, given that it is more flexible.
+
+```{r}
+# Determine the prunning parameter using cross validation
+train <- clean_names(train)
+tree.model <- tree(price~., train)
+cv.model <- cv.tree(tree.model)
+plot(cv.model$size, cv.model$dev, type="b")
+```
+
+As we can see, the best complexity parameter is 9, which we will use below. Also, the fact that the cross validation MSE is consistently decreasing as complexity increases implies that this model might once again be too inflexible for the data.
+
+```{r}
+# prune the tree using the correct parameter
+prunned.tree <- prune.tree(tree.model, best=9)
+plot(prunned.tree)
+text(prunned.tree)
+```
+```{r}
+# get test MSE
+test <- clean_names(test)
+y.pred <- predict(prunned.tree, newdata=test)
+MSE.test_tree<- mean((test$price - y.pred) ^ 2)
+MSE.test_tree
+```
+
+Tje test MSE for this decision tree is even higher than with Lasso regression at 131.4 vs 116.1, respectively. This shows it's of worse fit but at least, by looking at the tree itself, we can once again see the prevalence of oil, wind speed, coal and others in the first splits, once again hinting at their importance.
+
+#### 3.3: Bagged Decision Tree
+
+Given that the past two models have underfit the data, I will now try to use a model that is significantly more complex, by using Bagged Decision Trees. We can achieve this by using the random forest algorithm, and specify that at each split, we should consider all the predictors available, not just a random subset.
+
+```{r}
+bag.model <- randomForest(price ~., data=train, importance=TRUE, mtry=(dim(train)[2]-1))
+varImpPlot(bag.model)
+```
+
+```{r}
+# get test MSE
+y.pred <- predict(bag.model, newdata=test)
+MSE.test_bag <- mean((test$price - y.pred) ^ 2)
+MSE.test_bag
+```
+
+As we can see, the test MSE is now 29.9, which is far, far lower than for the other models, implying a much better fit. However, it is very interesting to see that the same pattern from the previous model holds once we analyze the importance of each predictor: Gas, Others and Wind Speed are the most important. Unfourtunately, I was not able to use cross-validation with this method to determine the number of trees that should be grown, but instead just using 500, due to the computational constraints. However, given the dramatic improvement in test MSE, we can conclude that this model is good at modelling this data.
+
+#### Part 4: Production vs. Weather Data
+
+In this part, I want to test two different subsets of predictors from the data. It seems to me that the production data (nuclear, gas, coal, etc) and the weather data are related to price in a different way, because production values can be controlled by humans whereas humans can't control the weather. For example, an engineer can increase the water flow in a dam to generate more electricity if required, but we cannot control the average temperature at any given point. I think separating these two data types can give us a clearer, more accurate picture of each.
+
+```{r}
+# create production data
+train.production <- train[,c(1,2,3,4,5,6,7,8,9,10,21,22)]
+train.production$price <- train$price
+test.production <- test[,c(1,2,3,4,5,6,7,8,9,10,21,22)]
+test.production$price <- test$price
+```
+
+#### 4.1.1: Feature Selection using Lasso Regression for Production Data
+
+```{r}
+# scale the production data for Lasso
+scaled.train_production <- scaled.train[,c(1,2,3,4,5,6,7,8,9,10,21,22)]
+scaled.train_production$price <- scaled.train$Price
+# fit a lasso regression model using 5-fold cross validation
+production.cv_lasso <- cv.glmnet(x=as.matrix(scaled.train_production[,-13]), y=scaled.train_production$price, nfolds=5)
+plot(production.cv_lasso)
+```
+
+```{r}
+# Get coefficients for the linear regression model using that lambda value
+coef(production.cv_lasso, production.cv_lasso$lambda.min)
+```
+
+```{r}
+# get test MSE
+scaled.test_production <- scaled.test[,c(1,2,3,4,5,6,7,8,9,10,21,22)]
+scaled.test_production$price <- scaled.test$Price
+y.pred <- predict(production.cv_lasso, newx=as.matrix(scaled.test_production[,-13]), s=production.cv_lasso$lambda.min)
+MSE.test_lasso <- mean((scaled.test_production$price - y.pred) ^ 2)
+MSE.test_lasso
+```
+
+Once again, we see that the test MSE is quite high, and higher than the test MSE of the Lasso regression model which also involved the weather data, which implies the weather data is important too. However, we can still see the same trend with Gas and Coal (big, positive coefficients) which gives more evidence that these are the most influential methods of energy production.
+
+#### 4.1.2: Simple Decision Tree
+
+```{r}
+# fit the tree using production data and 5-fold cross validation
+tree.model <- tree(price~., train.production)
+cv.model <- cv.tree(tree.model)
+plot(cv.model$size, cv.model$dev, type="b")
+```
+
+```{r}
+prunned.production_tree <- prune.tree(tree.model, best=8)
+plot(prunned.production_tree)
+text(prunned.production_tree)
+```
+
+```{r}
+# get test MSE
+y.pred <- predict(prunned.production_tree, newdata=test.production)
+MSE.test_tree<- mean((test$price - y.pred) ^ 2)
+MSE.test_tree
+```
+
+Very similar to above, we see a worsening of the test MSE, but we can still see the prevalence of Gas and Coal.
+
+#### 4.1.3: Bagged Decision Tree
+
+```{r}
+# fit the bagged decision tree model
+bag.model <- randomForest(price ~., data=train.production, importance=TRUE, mtry=(dim(train.production)[2]-1))
+varImpPlot(bag.model)
+```
+
+```{r}
+# get test MSE
+y.pred <- predict(bag.model, newdata=test.production)
+MSE.test_rf<- mean((test.production$price - y.pred) ^ 2)
+MSE.test_rf
+```
+
+Once again, we see that test MSE is slightly worse without the weather data, but on the other hand, we have even more proof that Gas is the most important production factor.
+
+#### 4.2: Analysis of Weather Data
+
+Here, I will repeat the analysis from above but only using the weather data, to see how each of these "natural" variables affect price.
+
+```{r}
+# create weather data
+train.weather <- train[,-c(1,2,3,4,5,6,7,8,9,10,21,22)]
+train.weather$price <- train$price
+test.weather <- test[,-c(1,2,3,4,5,6,7,8,9,10,21,22)]
+test.weather$price <- test$price
+```
+
+#### 4.2.1: Feature Selection using Lasso Regression for Weather Data
+
+```{r}
+# scale weather data for Lasso regression
+scaled.train_weather <- scaled.train[,-c(1,2,3,4,5,6,7,8,9,10,21,22,23)]
+scaled.train_weather$price <- scaled.train$Price
+# fit a Lasso regression model using 5-fold cv
+weather.cv_lasso <- cv.glmnet(x=as.matrix(scaled.train_weather[,-11]), y=scaled.train_weather$price, nfolds=5)
+plot(weather.cv_lasso)
+```
+
+```{r}
+# Get coefficients for the linear regression model using that lambda value
+coef(weather.cv_lasso, weather.cv_lasso$lambda.min)
+```
+
+```{r}
+# get test MSE
+scaled.test_weather <- scaled.test[,-c(1,2,3,4,5,6,7,8,9,10,21,22,23)]
+scaled.test_weather$price <- scaled.test$Price
+y.pred <- predict(weather.cv_lasso, newx=as.matrix(scaled.test_weather[,-11]), s=weather.cv_lasso$lambda.min)
+MSE.test_lasso <- mean((scaled.test_weather$price - y.pred) ^ 2)
+MSE.test_lasso
+```
+
+Again,, we can see that Lasso Regression did not take out any of the coefficients, but at least we can see that the coefficients for the temperature variables and wind speed have large absolute values, which is in line with what we expect from before. 
+
+#### 4.2.2: Simple Decision Tree
+
+```{r}
+tree.weather_model <- tree(price~., train.weather)
+cv.model <- cv.tree(tree.weather_model)
+plot(cv.model$size, cv.model$dev, type="b")
+```
+
+```{r}
+prunned.weather_tree <- prune.tree(tree.weather_model, best=5)
+plot(prunned.weather_tree)
+text(prunned.weather_tree)
+```
+
+```{r}
+# get test MSE
+y.pred <- predict(prunned.weather_tree, newdata=test.weather)
+MSE.test_tree<- mean((test$price - y.pred) ^ 2)
+MSE.test_tree
+```
+
+As we can see, the test MSE is very high here too, but at least we still can see that wind speed and the temperature variables are the most porminent on the tree.
+
+#### 4.3: Bagged Decision Tree
+
+```{r}
+bag.model <- randomForest(price ~., data=train.weather, importance=TRUE, mtry=(dim(train.weather)[2]-1))
+varImpPlot(bag.model)
+```
+
+```{r}
+# get test MSE
+y.pred <- predict(bag.model, newdata=test.weather)
+MSE.test_bag<- mean((test.weather$price - y.pred) ^ 2)
+MSE.test_bag
+```
+
+Similar to the 2 previous models, this bagged random forest has a substantially higher test MSE than the corresponding one with production variables, which again hints at the higher importance of those variables at determining prices. 
+
+#### Part 5: Conclusion
+
+from this analysis, we can conclude several things, which I will name below:
+
+* Production variables such as Gas, Coal, Nuclear, etc are quite a bit more important to determine electricity prices than weather variables. Chief amongst those variables, is Gas, which makes a lot of sense given the actual energy crisis which is mostly caused by a shortage of natural Gas supply in Europe due to armed conflicts. The bagged deicion tree model, the more accurate one so far, yielded a test MSE of 29.9 when using all the variables, and slightly higher at 36 when using just the production variables. However, it yielded a much higher test MSE of 111.9 when just using the weather variables.
+
+* However, the weather variables can be helpful when analyzing electricity prices, as we saw that the models that included all variables had lower test MSE's than the corresponding ones with just production or weather variables. On their own, we can see that in general, the temperature variables seem to dominate over all other weather variables. 
+
+* In general, the problem of determining Gas prices is a highly non-linear one, which is why we saw the dramatic decrease in test MSE in every scenario once we moved to a more flexible model. 
+
+
