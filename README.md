@@ -2,11 +2,11 @@
 
 ## Overview
 
-This project presents an in-depth exploratory data analysis (EDA) of energy prices in Spain. Utilizing comprehensive datasets, the study focuses on uncovering trends, patterns, and insights related to the fluctuation of energy costs over time. The data is taken from ENTSOE, a public portal for Transmission Service Operator (TSO) data.
+This project presents an in-depth exploratory data analysis (EDA) of energy prices in Spain. Utilizing comprehensive datasets, the study focuses on uncovering trends, patterns, and insights related to the fluctuation of energy costs over time. The data is taken from ENTSOE, a public portal for Transmission Service Operator (TSO) data. The full notebook can be accessed through my dropbox https://www.dropbox.com/home?preview=550presentation.html
 
 ## Methods
 
-Three algorithms are used to aid in the inference process: L1-Penalized Lasso regression, a simple decision tree and a bagged decision tree algorithm. 
+Three algorithms are used to aid in the inference process: L1-Penalized Lasso regression, a simple decision tree and a bagged decision tree. 
 
 ## Results (Taken from Notebook)
 
