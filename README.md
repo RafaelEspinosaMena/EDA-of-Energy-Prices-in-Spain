@@ -6,7 +6,7 @@ This project presents an in-depth exploratory data analysis (EDA) of energy pric
 
 ## Methods
 
-Three algorithms are used to aid in the inference process: L1-Penalized Lasso regression, a simple decision tree and XGBoost. 
+Three algorithms are used to aid in the inference process: L1-Penalized Lasso regression, a simple decision tree and a bagged decision tree algorithm. 
 
 ## Results (Taken from Notebook)
 
